@@ -2,6 +2,7 @@ import os
 import copy
 import time
 import math
+import pickle
 import random
 
 import torch
@@ -15,23 +16,19 @@ from transformers import (
     RobertaTokenizer,
     BertConfig,
     BertTokenizer,
-    ElectraConfig,
-    ElectraTokenizer,
     BartConfig,
     BartTokenizer,
     T5Config,
     T5Tokenizer,
     GPT2Config,
     GPT2Tokenizer,
-    BartConfig as CPTConfig,
 )
-from models.modeling_roberta import RobertaForMaskedLM
-from models.modeling_bart import BartForConditionalGeneration
-from models.modeling_t5 import T5ForConditionalGeneration
-from models.modeling_gpt2 import GPT2LMHeadModel
-from models.modeling_bert import BertForMaskedLM
-from models.modeling_electra import ElectraForMaskedLM
-from models.modeling_cpt import CPTForMaskedLM
+from models.deep_modeling_roberta import RobertaForMaskedLM
+from models.deep_modeling_bart import BartForConditionalGeneration
+from models.deep_modeling_t5 import T5ForConditionalGeneration
+from models.deep_modeling_gpt2 import GPT2LMHeadModel
+from models.deep_modeling_bert import BertForMaskedLM
+from models.deep_modeling_cpt import CPTForMaskedLM
 from utils import hinge_loss
 from sklearn.metrics import f1_score
 
@@ -39,11 +36,11 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--model_name", default='roberta-large',
                     choices=['roberta-base', 'roberta-large',
                              'bert-base-uncased', 'bert-large-uncased',
-                             'google/electra-base-generator', 'google/electra-large-generator',
                              'facebook/bart-base', 'facebook/bart-large',
                              't5-small', 't5-base', 't5-large', 't5-3b',
                              'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl',
-                             'fnlp/cpt-large'], type=str)
+                             'fnlp/cpt-large',
+                             ], type=str)
 parser.add_argument("--task_name", default='sst2', type=str)
 parser.add_argument("--n_prompt_tokens", default=50, type=int)
 parser.add_argument("--intrinsic_dim", default=500, type=int)
@@ -52,7 +49,8 @@ parser.add_argument("--batch_size", default=32, type=int)
 parser.add_argument("--budget", default=8000, type=int)
 parser.add_argument("--popsize", default=20, type=int)
 parser.add_argument("--bound", default=0, type=int)
-parser.add_argument("--sigma", default=1, type=float)
+parser.add_argument("--sigma1", default=1, type=float)
+parser.add_argument("--sigma2", default=0.2, type=float)
 parser.add_argument("--print_every", default=50, type=int)
 parser.add_argument("--eval_every", default=100, type=int)
 parser.add_argument("--device", default='cuda:0', type=str)
@@ -61,7 +59,6 @@ parser.add_argument("--random_proj", default='normal', type=str)
 parser.add_argument("--seed", default=42, type=int)
 parser.add_argument("--loss_type", default='ce', type=str)
 parser.add_argument("--cat_or_add", default='add', type=str)
-parser.add_argument("--parallel", action='store_true', help='Whether to allow parallel evaluation')
 parser.add_argument(
     "--inference_framework",
     default='pt',
@@ -86,8 +83,11 @@ elif model_name in ['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl']:
     from dataloader_gpt import SST2Loader, AGNewsLoader, YelpPLoader, DBPediaLoader, RTELoader, MRPCLoader, SNLILoader
     from metrics_gpt import SST2Metric, AGNewsMetric, YelpPMetric, DBPediaMetric, RTEMetric, MRPCMetric, SNLIMetric
 elif model_name in ['fnlp/cpt-large']:
-    from dataloader_cpt import ChnSentLoader, AmazonLoader, THUCNewsLoader, BQLoader, CMNLILoader, CCPMLoader, TNewsLoader, OCNLILoader, LCQMCLoader, C3Loader
-    from metrics_cpt import ChnSentMetric, AmazonMetric, THUCNewsMetric, BQMetric, CMNLIMetric, CCPMMetric, TNewsMetric, OCNLIMetric, LCQMCMetric, C3Metric
+    from dataloader_cpt import ChnSentLoader, AmazonLoader, THUCNewsLoader, BQLoader, CMNLILoader, CCPMLoader, \
+        TNewsLoader, \
+        OCNLILoader, LCQMCLoader, C3Loader
+    from metrics_cpt import ChnSentMetric, AmazonMetric, THUCNewsMetric, BQMetric, CMNLIMetric, CCPMMetric, TNewsMetric, \
+        OCNLIMetric, LCQMCMetric, C3Metric
 else:
     from dataloader import SST2Loader, AGNewsLoader, YelpPLoader, DBPediaLoader, RTELoader, MRPCLoader, SNLILoader
     from metrics import SST2Metric, AGNewsMetric, YelpPMetric, DBPediaMetric, RTEMetric, MRPCMetric, SNLIMetric
@@ -99,14 +99,8 @@ k_shot = args.k_shot
 batch_size = args.batch_size
 budget = args.budget
 bound = args.bound
-sigma = args.sigma
-# bound = math.sqrt(intrinsic_dim)
-# if random_proj == 'normal':
-#     bound = math.pow(intrinsic_dim, 0.75)
-# elif model_name in ['t5-small', 't5-base', 't5-large', 't5-3b']:
-#     bound = 100
-# else:
-#     bound = 5
+sigma1 = args.sigma1
+sigma2 = args.sigma2
 if args.popsize > 0:
     popsize = args.popsize
 else:
@@ -121,15 +115,9 @@ eval_every = args.eval_every
 # if task_name in ['mrpc', 'snli', 'qnli', 'rte']:
 #     args.cat_or_add = 'cat'
 cat_or_add = args.cat_or_add
-parallel = args.parallel
 inference_framework = args.inference_framework
 onnx_model_path = args.onnx_model_path
-
-if inference_framework not in ['pt', 'ort']:
-    raise ValueError(f'inference_framework only supports "pt", "ort", got `{inference_framework}` instead.')
-if inference_framework == 'ort':
-    assert onnx_model_path is not None, 'Path to onnx model is required, got None instead.'
-    assert os.path.exists(onnx_model_path), f'In valid onnx model path `{onnx_model_path}`'
+save_hiddens = True
 
 # fixed hyper-params
 if cat_or_add == 'add':
@@ -152,7 +140,7 @@ elif task_name in ['dbpedia', 'tnews']:
 else:
     raise ValueError
 
-# save_path = '{}_results/{}_results/D_{}_d_{}_data_{}_{}_range_{}_loss_{}_budget_{}_seed_{}_{}_{}_{}_{}'.format(
+# save_path = 'deep_{}_results/{}_results/D_{}_d_{}_data_{}_{}_range_{}_loss_{}_budget_{}_seed_{}_{}_{}_{}'.format(
 #     model_name.replace('/', '-'),
 #     task_name,
 #     n_prompt_tokens * 1024,
@@ -165,7 +153,6 @@ else:
 #     seed,
 #     cat_or_add,
 #     random_proj,
-#     'parallel' if parallel else 'serial',
 #     inference_framework
 # )
 # print('Results will be saved in {}'.format(save_path))
@@ -175,7 +162,7 @@ else:
 #     exit()
 #
 # args.save_path = save_path
-args.bbt_version = 'bbt'
+args.bbt_version = 'deepbbt'
 
 # log_dir = './v2_logs'
 # fitlog.set_log_dir(log_dir)
@@ -190,7 +177,8 @@ torch.manual_seed(seed)
 
 class LMForwardAPI:
     def __init__(self, model_name='roberta-large', n_prompt_tokens=50, task_name='sst2',
-                 loss_type='hinge', init_prompt_path=None):
+                 loss_type='hinge'):
+        self.model_name = model_name
         if model_name in ['roberta-base', 'roberta-large']:
             self.config = RobertaConfig.from_pretrained(model_name)
             self.tokenizer = RobertaTokenizer.from_pretrained(model_name)
@@ -206,14 +194,6 @@ class LMForwardAPI:
             self.config = BertConfig.from_pretrained(model_name)
             self.tokenizer = BertTokenizer.from_pretrained(model_name)
             self.model = BertForMaskedLM.from_pretrained(
-                model_name,
-                config=self.config,
-                n_prompt_tokens=n_prompt_tokens,
-            )
-        elif model_name in ['google/electra-base-generator', 'google/electra-large-generator']:
-            self.config = ElectraConfig.from_pretrained(model_name)
-            self.tokenizer = ElectraTokenizer.from_pretrained(model_name)
-            self.model = ElectraForMaskedLM.from_pretrained(
                 model_name,
                 config=self.config,
                 n_prompt_tokens=n_prompt_tokens,
@@ -243,7 +223,7 @@ class LMForwardAPI:
                 n_prompt_tokens=n_prompt_tokens,
             )
         elif model_name in ['fnlp/cpt-large']:
-            self.config = CPTConfig.from_pretrained(model_name)
+            self.config = BartConfig.from_pretrained(model_name)
             self.tokenizer = BertTokenizer.from_pretrained(model_name)
             self.model = CPTForMaskedLM.from_pretrained(
                 model_name,
@@ -252,31 +232,27 @@ class LMForwardAPI:
             )
         else:
             raise NotImplementedError
+
+        if random_proj == 'normal':
+            self.config.output_hidden_states = True
+
         if inference_framework == 'ort':
             self.model.roberta = None
-        if cat_or_add == 'cat':
-            self.model.set_concat_prompt(True)
-            if init_prompt_path is not None:
-                print('Initialize prompt embedding from {}'.format(init_prompt_path))
-                self.init_prompt = torch.load(init_prompt_path).weight.cpu().reshape(-1)
-            else:
-                print('Initial prompt embedding not found. Initialize to zero embedding.')
-                self.init_prompt = torch.zeros(n_prompt_tokens * self.config.hidden_size)
-            print('Shape of initial prompt embedding: {}'.format(self.init_prompt.shape))
-        else:
-            # self.model.set_concat_prompt(False)
-            self.init_prompt = None
+        self.best_prefix = torch.zeros(self.config.num_hidden_layers, n_prompt_tokens, self.config.hidden_size,
+                                       device=device)
+        self.best = None
+        self.init_prompt = None
         self.model.to(device)
         self.model.eval()
-        self.linear = torch.nn.Linear(intrinsic_dim, n_prompt_tokens * self.config.hidden_size, bias=False)
+        self.linear = torch.nn.ModuleList(
+            [torch.nn.Linear(intrinsic_dim, n_prompt_tokens * self.config.hidden_size, bias=False) for _ in
+             range(self.config.num_hidden_layers)])
         if random_proj == 'normal':
             # calculate std for normal distribution
             if model_name in ['roberta-base', 'roberta-large']:
                 embedding = self.model.roberta.get_input_embeddings().weight.clone().cpu()
             elif model_name in ['bert-base-uncased', 'bert-large-uncased']:
                 embedding = self.model.bert.get_input_embeddings().weight.clone().cpu()
-            elif model_name in ['google/electra-base-generator', 'google/electra-large-generator']:
-                embedding = self.model.electra.get_input_embeddings().weight.clone().cpu()
             elif model_name in ['facebook/bart-base', 'facebook/bart-large', 'fnlp/cpt-large']:
                 embedding = self.model.model.get_input_embeddings().weight.clone().cpu()
             elif model_name in ['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl']:
@@ -286,17 +262,17 @@ class LMForwardAPI:
             # embedding = embedding[1000: 2000]
             mu_hat = np.mean(embedding.reshape(-1).detach().cpu().numpy())
             std_hat = np.std(embedding.reshape(-1).detach().cpu().numpy())
-            mu = 0.0
-            std = std_hat / (np.sqrt(intrinsic_dim) * args.sigma)
             # temp = intrinsic_dim - std_hat * std_hat
             # mu = mu_hat / temp
             # std = std_hat / np.sqrt(temp)
+            mu = 0.0
+            std = std_hat / (np.sqrt(intrinsic_dim) * args.sigma1)
             print('[Embedding] mu: {} | std: {} [RandProj]  mu: {} | std: {}'.format(mu_hat, std_hat, mu, std))
-            for p in self.linear.parameters():
-                torch.nn.init.normal_(p, mu, std)
+            for p in self.linear[0].parameters():
+                torch.nn.init.normal_(p, 0.0, std)
+            self.intermediate_stats = [(mu, std)]
         self.best_train_perf = 0.0
         self.best_dev_perf = 0.0
-        self.best_prompt = None
         self.num_call = 0
         # self.save_path = save_path
         self.print_every = print_every
@@ -406,40 +382,18 @@ class LMForwardAPI:
 
         return loss, perf
 
-    def eval(self, prompt_embedding=None, test_data=None):
+    def eval(self, prompt_embedding=None, layer_id=None, test_data=None):
         self.num_call += 1
-        if prompt_embedding is None:
-            prompt_embedding = self.best_prompt
-        if test_data is None:
-            bsz = len(dev_data['input_ids'])  # batch size of dev data is the orignal batch size of training data
-        else:
-            bsz = batch_size  # for test data
-        tmp_prompt = copy.deepcopy(prompt_embedding)  # list or numpy.ndarray
-        if isinstance(prompt_embedding, list):  # multiple queries
-            pe_list = []
-            for pe in prompt_embedding:
-                z = torch.tensor(pe).type(torch.float32)  # z
-                z = self.linear(z)  # Az
-                if self.init_prompt is not None:
-                    z = z + self.init_prompt  # Az + p_0
-                pe_list.append(z.reshape(n_prompt_tokens, -1).repeat(bsz, 1, 1))
-            prompt_embedding = torch.cat(pe_list)  # num_workers*bsz x prompt_len x dim
-            assert len(prompt_embedding) == len(train_data['input_ids'])
-        elif isinstance(prompt_embedding, np.ndarray):  # single query or None
+        best_prefix = self.best_prefix.clone()
+        if prompt_embedding is not None:
             prompt_embedding = torch.tensor(prompt_embedding).type(torch.float32)  # z
-            prompt_embedding = self.linear(prompt_embedding)  # Az
-            if self.init_prompt is not None:
-                prompt_embedding = prompt_embedding + self.init_prompt  # Az + p_0
-            prompt_embedding = prompt_embedding.reshape(n_prompt_tokens, -1).repeat(bsz, 1, 1)
-        else:
-            raise ValueError(
-                f'[Prompt Embedding] Only support [list, numpy.ndarray], got `{type(prompt_embedding)}` instead.'
-            )
-        self.model.set_prompt_embedding(prompt_embedding)
+            prompt_embedding = self.linear[layer_id](prompt_embedding).reshape(-1, self.config.hidden_size)  # Az
+            best_prefix[layer_id] = prompt_embedding
+
+        self.model.set_prompt_embedding(best_prefix)
 
         if isinstance(test_data, DataSet):
-            if prompt_embedding.shape[0] > bsz:
-                raise ValueError('Provide a single prompt embedding for testing.')
+            self.model.set_prompt_embedding(self.best)
             test_tester = Tester(data=test_data, model=self.model, metrics=self.metric, batch_size=batch_size,
                                  num_workers=1, device=device, use_tqdm=True)
             results = test_tester.test()
@@ -451,39 +405,77 @@ class LMForwardAPI:
                 train_data[k] = v.to(device)
             with torch.no_grad():
                 if model_name in ['t5-small', 't5-base', 't5-large', 't5-3b']:
-                    logits = self.model(
+                    outputs = self.model(
                         input_ids=train_data['input_ids'],
                         attention_mask=train_data['attention_mask'],
                         decoder_input_ids=train_data['decoder_input_ids'],
                         decoder_attention_mask=train_data['decoder_attention_mask'],
-                    )['logits']
+                    )
                 elif model_name in ['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl']:
-                    logits = self.model(
+                    outputs = self.model(
                         input_ids=train_data['input_ids'],
                         attention_mask=train_data['attention_mask'],
-                    )['logits']
+                    )
                 else:
-                    logits = self.model(
+                    outputs = self.model(
                         input_ids=train_data['input_ids'],
                         attention_mask=train_data['attention_mask'],
                         mask_pos=train_data['mask_pos'],
-                    )['logits']
+                    )
+                logits = outputs['logits']
+                if random_proj == 'normal' and len(self.intermediate_stats) == 1:
+                    # if is the first forward pass, record the range of hidden states of each layer
+                    print('Calculating std for random projections...')
+                    if self.model_name in ['facebook/bart-base', 'facebook/bart-large',
+                                           't5-small', 't5-base', 't5-large', 't5-3b',
+                                           'fnlp/cpt-large',
+                                           ]:
+                        hidden_states = outputs['encoder_hidden_states']
+                    else:
+                        hidden_states = outputs['hidden_states']
+                    for i, h in enumerate(hidden_states[1:-1]):
+                        if save_hiddens:
+                            hid_path = './hidstates/{}'.format(self.model_name.split('/')[-1])
+                            if not os.path.exists(hid_path):
+                                os.makedirs(hid_path, exist_ok=True)
+                            with open('{}/hidden_{}.bin'.format(hid_path, i + 1), 'wb') as f:
+                                pickle.dump(h, f)
+                        print('[Layer {}]'.format(i + 1))
+                        hidden = h.clone().reshape(-1).detach().cpu().numpy()
+                        mu_hat = np.mean(hidden)
+                        std_hat = np.std(hidden)
+                        max_h = np.max(hidden)
+                        min_h = np.min(hidden)
+                        print(' - Before clipping: mu=%.4f, std=%.4f, min=%.4f, max=%.4f' % (
+                            mu_hat, std_hat, min_h, max_h))
+                        # Clipping outliers
+                        clip_round = 0
+                        while clip_round < 5:
+                            clip_round += 1
+                            min_bound = mu_hat - 3 * std_hat
+                            max_bound = mu_hat + 3 * std_hat
+                            hidden = np.clip(hidden, min_bound, max_bound)
+                            mu_hat = np.mean(hidden)
+                            std_hat = np.std(hidden)
+                            max_h = np.max(hidden)
+                            min_h = np.min(hidden)
+                            print(' - After clipping (round %d): mu=%.4f, std=%.4f, min=%.4f, max=%.4f' % (
+                                clip_round, mu_hat, std_hat, min_h, max_h))
+                        # Calculating std dev for the random projection
+                        mu = 0.0
+                        std = std_hat / (np.sqrt(intrinsic_dim) * args.sigma1)
+                        # temp = intrinsic_dim - std_hat * std_hat
+                        # mu = mu_hat / temp
+                        # std = std_hat / np.sqrt(temp)
+                        print(' - Random Projection: mu=%.4f, std=%.4f' % (mu, std))
+                        for p in self.linear[i + 1].parameters():
+                            torch.nn.init.normal_(p, mu, std)
+                        self.intermediate_stats.append((mu, std))
+                    assert len(self.intermediate_stats) == self.config.num_hidden_layers
+                    self.model.config.output_hidden_states = None
+                    print('Random projections initialized.')
 
-            if parallel:  # we have multiple queries
-                all_losses, all_perfs = [], []
-                for i in range(len(logits) // bsz):
-                    tmp_logits = logits[i * bsz:i * bsz + bsz]
-                    tmp_target = train_data['labels'][i * bsz:i * bsz + bsz]
-                    tmp_loss, tmp_perf = self.calc_metric(tmp_logits, tmp_target)
-                    all_losses.append(tmp_loss)
-                    all_perfs.append(tmp_perf)
-                loss = min(all_losses)
-                best_sol = all_losses.index(loss)  # argmin
-                perf = all_perfs[best_sol]  # corresponding performance
-                tmp_prompt = tmp_prompt[best_sol]  # numpy.ndarray
-                prompt_embedding = pe_list[best_sol]  # to be prepended to the input
-            else:  # single query
-                loss, perf = self.calc_metric(logits, train_data['labels'])
+            loss, perf = self.calc_metric(logits, train_data['labels'])
             # fitlog.add_loss(loss, name=self.loss_type, step=self.num_call)
             # fitlog.add_metric(perf, name='train_acc', step=self.num_call)
 
@@ -493,7 +485,7 @@ class LMForwardAPI:
 
             # if self.save_path is not None:
             #     with open(os.path.join(self.save_path, 'train_acc.txt'), 'a') as fout:
-            #         fout.write('{}\t{}\n'.format(self.num_call, perf))
+            #         fout.write('{}\t{}\t{}\n'.format(self.num_call, loss, perf))
 
             if self.num_call % self.print_every == 0:
                 print(
@@ -505,8 +497,6 @@ class LMForwardAPI:
 
             if self.num_call % self.eval_every == 0:
                 print('********* Evaluated on dev set *********')
-                if parallel:  # if we have multiple queries, use the one that achieves minimal loss
-                    self.model.set_prompt_embedding(prompt_embedding)
                 for k, v in dev_data.items():
                     dev_data[k] = v.to(device)
                 with torch.no_grad():
@@ -534,27 +524,22 @@ class LMForwardAPI:
                 if dev_perf > self.best_dev_perf:
                     self.best_dev_perf = dev_perf
                     # fitlog.add_best_metric(self.best_dev_perf, name='dev_acc')
-                    self.best_prompt = copy.deepcopy(tmp_prompt)
+                    self.best = best_prefix.clone()
                 # if self.save_path is not None:
-                #     with open(os.path.join(self.save_path, 'dev_acc.txt'), 'a') as fout:
-                #         fout.write('{}\t{}\n'.format(self.num_call, dev_loss))
+                #     with open(os.path.join(self.save_path, 'dev_loss.txt'), 'a') as fout:
+                #         fout.write('{}\t{}\t{}\n'.format(self.num_call, dev_loss, dev_perf))
                 print('Dev loss: {}. Dev perf: {}. Best dev perf: {}'.format(
                     round(float(dev_loss), 4),
                     round(float(dev_perf), 4),
                     round(float(self.best_dev_perf), 4)))
                 print('********* Done *********')
-            if parallel:
-                return all_losses
-            else:
-                return loss
+            return loss
 
 
 if model_name in ['roberta-base', 'roberta-large']:
     tokenizer = RobertaTokenizer.from_pretrained(model_name)
 elif model_name in ['bert-base-uncased', 'bert-large-uncased', 'fnlp/cpt-large']:
     tokenizer = BertTokenizer.from_pretrained(model_name)
-elif model_name in ['google/electra-base-generator', 'google/electra-large-generator']:
-    tokenizer = ElectraTokenizer.from_pretrained(model_name)
 elif model_name in ['facebook/bart-base', 'facebook/bart-large']:
     tokenizer = BartTokenizer.from_pretrained(model_name)
 elif model_name in ['t5-small', 't5-base', 't5-large', 't5-3b']:
@@ -650,9 +635,11 @@ else:
     train_data, test_data = data_bundle.get_dataset('train'), data_bundle.get_dataset('validation')
 
 train_data, dev_data = construct_true_few_shot_data(train_data, k_shot)
+
 for ds in [train_data, dev_data, test_data]:
     ds.set_pad_val('input_ids', tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0)
     ds.set_pad_val('attention_mask', 0)
+
 print('# of train data: {}'.format(len(train_data)))
 print('Example:')
 print(train_data[0])
@@ -709,38 +696,37 @@ model_forward_api = LMForwardAPI(
     task_name=task_name,
     # save_path=save_path,
     loss_type=loss_type,
-    init_prompt_path=init_prompt_path
 )
 
 cma_opts = {
     'seed': seed,
     'popsize': popsize,
-    'maxiter': budget if parallel else budget // popsize,
+    'maxiter': budget // (popsize * model_forward_api.config.num_hidden_layers),
     'verbose': -1,
 }
 if bound > 0:
     cma_opts['bounds'] = [-1 * bound, 1 * bound]
-es = cma.CMAEvolutionStrategy(intrinsic_dim * [0], sigma, inopts=cma_opts)
-print('Population Size: {}'.format(es.popsize))
-print('{} Evaluation.'.format('Parallel' if parallel else 'Serial'))
-if parallel:
-    # expand training data to a larger batch for parallel evaluation
-    train_data['input_ids'] = train_data['input_ids'].repeat(es.popsize, 1)
-    train_data['attention_mask'] = train_data['attention_mask'].repeat(es.popsize, 1)
-    train_data['mask_pos'] = train_data['mask_pos'].repeat(es.popsize)
-    train_data['labels'] = train_data['labels'].repeat(es.popsize)
 
-# opt = cma.CMAOptions()
+sigmas = [sigma1]
+for i in range(model_forward_api.config.num_hidden_layers - 1):
+    sigmas.append(sigma2)
+    # sigmas.append(sigma1 * math.pow(0.9, i + 1))
+assert len(sigmas) == model_forward_api.config.num_hidden_layers
+es_list = [
+    cma.CMAEvolutionStrategy(intrinsic_dim * [0], sigmas[i], inopts=cma_opts)
+    for i in range(model_forward_api.config.num_hidden_layers)
+]
 start_time = time.time()
-while not es.stop():
-    solutions = es.ask()
-    if parallel:
-        fitnesses = model_forward_api.eval(solutions)
-    else:
-        fitnesses = [model_forward_api.eval(x) for x in solutions]
-    es.tell(solutions, fitnesses)
-    # es.logger.add()  # write data to disc to be plotted
-    # es.disp()
+
+for _ in range(budget // (int(popsize) * model_forward_api.config.num_hidden_layers)):
+    for i, es in enumerate(es_list):
+        solutions = es.ask()
+        fitnesses = [model_forward_api.eval(x, i) for x in solutions]
+        es.tell(solutions, fitnesses)
+        model_forward_api.best_prefix[i] = model_forward_api.linear[i](
+            torch.tensor(es.result.xbest).type(torch.float32)).reshape(-1,
+                                                                       model_forward_api.config.hidden_size)  # set best cv
+
 end_time = time.time()
 print('Done. Elapsed time: {} (mins)'.format((end_time - start_time) / 60))
 print('Evaluate on test data...')
